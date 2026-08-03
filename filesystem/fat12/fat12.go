@@ -500,7 +500,12 @@ func (fs *FileSystem) ReadDir(p string) ([]iofs.DirEntry, error) {
 	}
 	ret := make([]iofs.DirEntry, 0, len(entries))
 	for _, e := range entries {
-		if e.isVolumeLabel || e.filenameShort == "" || e.filenameShort == ".." || e.filenameShort == "." {
+		// An entry with neither name is padding rather than a file. One that has
+		// only a long name is listed under it: earlier releases wrote a blank 8.3
+		// name for any file whose name began with a dot, and those filesystems
+		// still have to be readable.
+		if e.isVolumeLabel || (e.filenameShort == "" && e.filenameLong == "") ||
+			e.filenameShort == ".." || e.filenameShort == "." {
 			continue
 		}
 		ret = append(ret, e)
@@ -544,12 +549,13 @@ func (fs *FileSystem) OpenFile(p string, flag int) (filesystem.File, error) {
 	}
 	offset := int64(0)
 	if flag&os.O_TRUNC == os.O_TRUNC && targetEntry.fileSize != 0 {
+		if err := fs.freeClusterChain(targetEntry.clusterLocation); err != nil {
+			return nil, fmt.Errorf("unable to release clusters for %s: %w", p, err)
+		}
 		targetEntry.fileSize = 0
+		targetEntry.clusterLocation = 0
 		if err := fs.writeDirectoryEntries(parentDir); err != nil {
 			return nil, fmt.Errorf("error writing directory file %s to disk: %w", p, err)
-		}
-		if _, err := fs.allocateSpace(1, targetEntry.clusterLocation); err != nil {
-			return nil, fmt.Errorf("unable to resize cluster list: %w", err)
 		}
 	}
 	if flag&os.O_APPEND == os.O_APPEND {
@@ -728,6 +734,22 @@ func (fs *FileSystem) SetRootDirLabel(volumeLabel string) error {
 
 // ── internal cluster / directory helpers ──────────────────────────────────────
 
+// freeClusterChain marks every cluster of the chain starting at firstCluster as
+// unused. A start below 2 refers to no clusters at all and is a no-op.
+func (fs *FileSystem) freeClusterChain(firstCluster uint32) error {
+	if firstCluster < 2 {
+		return nil
+	}
+	clusters, err := fs.getClusterList(firstCluster)
+	if err != nil {
+		return err
+	}
+	for _, cluster := range clusters {
+		fs.table.SetCluster(cluster, fs.table.UnusedMarker())
+	}
+	return fs.WriteFat()
+}
+
 func (fs *FileSystem) getClusterList(firstCluster uint32) ([]uint32, error) {
 	if firstCluster > fs.table.MaxCluster() || fs.table.ClusterValue(firstCluster) == 0 {
 		return nil, fmt.Errorf("invalid start cluster: %d", firstCluster)
@@ -852,11 +874,10 @@ func (fs *FileSystem) mkSubdir(parent *Directory, name string) (*directoryEntry,
 }
 
 func (fs *FileSystem) mkFile(parent *Directory, name string) (*directoryEntry, error) {
-	clusters, err := fs.allocateSpace(1, 0)
-	if err != nil {
-		return nil, fmt.Errorf("could not allocate disk space for file %s: %w", name, err)
-	}
-	return parent.createEntry(name, clusters[0], false)
+	// A new file has no content, so it gets no cluster: Write allocates the chain
+	// on demand. Recording a cluster for an empty file is what fsck.vfat reports
+	// as "File size is 0 bytes, cluster chain length is > 0 bytes".
+	return parent.createEntry(name, 0, false)
 }
 
 func (fs *FileSystem) mkLabel(parent *Directory, name string) (*directoryEntry, error) {
