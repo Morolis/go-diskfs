@@ -1436,7 +1436,10 @@ func (fs *FileSystem) Remove(p string) error {
 				blockBitmaps[bg] = dataBlockBitmap
 			}
 			// the extent lists the absolute block number, but the bitmap is relative to the block group
-			blockInBG := int(i) - int(fs.superblock.blocksPerGroup)*bg
+			// group bg's first block is firstDataBlock + bg*blocksPerGroup (firstDataBlock
+			// is 1 on 1 KiB-block images); ignoring firstDataBlock clears the wrong bit.
+			groupStart := uint64(fs.superblock.firstDataBlock) + uint64(bg)*uint64(fs.superblock.blocksPerGroup)
+			blockInBG := int(i - groupStart)
 			if err := dataBlockBitmap.Clear(blockInBG); err != nil {
 				return fmt.Errorf("could not clear block bitmap for block %d: %v", i, err)
 			}
@@ -1519,7 +1522,8 @@ func (fs *FileSystem) Remove(p string) error {
 
 	// remove the inode from the bitmap and write the inode bitmap back
 	// inode is absolute, but bitmap is relative to block group
-	inodeInBG := int(entry.inode) - int(fs.superblock.inodesPerGroup)*inodeBG
+	// bitmap start at 0, inode numbers start at 1, so need off-by-one
+	inodeInBG := int(entry.inode) - int(fs.superblock.inodesPerGroup)*inodeBG - 1
 	if err := inodeBitmap.Clear(inodeInBG); err != nil {
 		return fmt.Errorf("could not clear inode bitmap for inode %d: %v", entry.inode, err)
 	}
@@ -1528,13 +1532,30 @@ func (fs *FileSystem) Remove(p string) error {
 		return fmt.Errorf("could not write inode bitmap back to disk: %v", err)
 	}
 
+	// wipe the now-free inode table entry so it cannot be mistaken for a live
+	// inode after the bitmap is reused. writeInode recomputes the checksum.
+	removedInode.hardLinks = 0
+	removedInode.deletionTime = uint32(time.Now().Unix())
+	removedInode.size = 0
+	removedInode.blocks = 0
+	if err := fs.writeInode(removedInode); err != nil {
+		return fmt.Errorf("could not mark removed inode %d as deleted: %v", entry.inode, err)
+	}
+
 	// Update the group descriptor: free inode count, free block count, used directory count; and write GD
 	gd := &fs.groupDescriptors.descriptors[inodeBG]
 
 	// update the group descriptor inodes and blocks
 	gd.freeInodes++
-	gd.freeBlocks += uint32(removedInode.blocks)
 	if entry.fileType == dirFileTypeDirectory {
+		// a subdirectory's ".." entry counts as a link to its parent, so removing
+		// an empty directory must decrement the parent's link count.
+		if parentInode.hardLinks > 0 {
+			parentInode.hardLinks--
+			if err := fs.writeInode(parentInode); err != nil {
+				return fmt.Errorf("could not update parent inode %d link count: %v", parentInode.number, err)
+			}
+		}
 		gd.usedDirectories--
 	}
 
@@ -1547,7 +1568,9 @@ func (fs *FileSystem) Remove(p string) error {
 	// but we do not need to do so. Since we are not reusing the inode, we can just leave it there,
 	// the bitmap always is checked before reusing an inode location.
 	fs.superblock.freeInodes++
-	fs.superblock.freeBlocks += removedInode.blocks
+	// totalFreed = actual filesystem blocks freed from extents above,
+	// not removedInode.blocks (which is in 512-byte sectors and may span groups)
+	fs.superblock.freeBlocks += totalFreed
 	return fs.writeSuperblock()
 }
 
