@@ -683,7 +683,9 @@ func createFragmentedFile(t *testing.T, fs *FileSystem, name string, fillA, fill
 		if _, err := f.Write(data); err != nil {
 			t.Fatalf("Write %s: %v", p, err)
 		}
-		f.Close()
+		if err := f.Close(); err != nil {
+			t.Fatalf("Close %s: %v", p, err)
+		}
 	}
 
 	write(name, bytes.Repeat([]byte{fillA}, aBlocks*blockSize))
@@ -700,18 +702,26 @@ func createFragmentedFile(t *testing.T, fs *FileSystem, name string, fillA, fill
 	if _, err := f.Write(bytes.Repeat([]byte{fillB}, bBlocks*blockSize)); err != nil {
 		t.Fatalf("Write append: %v", err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 
 	// sanity: the file really is fragmented, otherwise the test proves nothing
 	r, err := fs.OpenFile(name, os.O_RDONLY)
 	if err != nil {
 		t.Fatalf("OpenFile %s for inspect: %v", name, err)
 	}
-	exts := r.(*File).extents
+	filePtr, ok := r.(*File)
+	if !ok {
+		t.Fatalf("expected *File, got %T", r)
+	}
+	exts := filePtr.extents
 	if len(exts) < 2 {
 		t.Fatalf("expected at least 2 extents, got %d: %+v", len(exts), exts)
 	}
-	r.Close()
+	if err := r.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 
 	content := append(bytes.Repeat([]byte{fillA}, aBlocks*blockSize), bytes.Repeat([]byte{fillB}, bBlocks*blockSize)...)
 	return content
@@ -805,7 +815,9 @@ func TestWriteUnalignedOffsetFragmented(t *testing.T) {
 		if _, err := w.Write(patch); err != nil {
 			t.Fatalf("Write at %d: %v", off, err)
 		}
-		w.Close()
+		if err := w.Close(); err != nil {
+			t.Fatalf("Close w: %v", err)
+		}
 
 		r, err := fs.OpenFile("/frag.dat", os.O_RDONLY)
 		if err != nil {
@@ -821,7 +833,9 @@ func TestWriteUnalignedOffsetFragmented(t *testing.T) {
 		if !bytes.Equal(got, patch) {
 			t.Errorf("write at %d not read back correctly", off)
 		}
-		r.Close()
+		if err := r.Close(); err != nil {
+			t.Fatalf("Close r: %v", err)
+		}
 	}
 }
 
